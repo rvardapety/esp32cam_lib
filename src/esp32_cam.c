@@ -1,90 +1,153 @@
 #include "esp32_cam.h"
-#include <stdio.h>
 #include <stdlib.h>
 #include <fcntl.h>
-#include <stdbool.h>
 #include <unistd.h>
+#include <stdbool.h>
 #include <termios.h>
+#include <stdint.h>
 
-#define CMD_TRIGGER_CAPTURE 0xAA  // Custom simple protocol command byte
+#define UART_DEVICE "/dev/serial0"
+#define UART_BAUDRATE B115200
+#define CMD_TRIGGER_CAPTURE 0xAA
+#define FRAME_LENGTH_SIZE 4
+#define MAX_FRAME_SIZE 500000
 
-static int uart_fd = -1;
+int file;
 
-bool esp32_cam_init(const char *serial_device) {
-    // Open the serial device (e.g., "/dev/serial0" or "/dev/ttyUSB0")
-    uart_fd = open(serial_device, O_RDWR | O_NOCTTY | O_NDELAY);
-    if (uart_fd < 0) {
+bool esp32_cam_init(void) {
+
+    if ((file = open(UART_DEVICE, O_RDWR | O_NOCTTY)) < 0) {
         return false;
     }
 
-    // Configure low-level UART hardware settings via termios
     struct termios options;
-    tcgetattr(uart_fd, &options);
-    cfsetispeed(&options, B115200);
-    cfsetospeed(&options, B115200);
+
+    if (tcgetattr(file, &options) < 0) {
+        close(file);
+        return false;
+    }
+
+    cfsetispeed(&options, UART_BAUDRATE);
+    cfsetospeed(&options, UART_BAUDRATE);
 
     options.c_cflag |= (CLOCAL | CREAD);
-    options.c_cflag &= ~PARENB;      // No parity
-    options.c_cflag &= ~CSTOPB;      // 1 Stop bit
-    options.c_cflag &= ~CSIZE;
-    options.c_cflag |= CS8;          // 8 Data bits
-    options.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG); // Raw input mode
-    options.c_oflag &= ~OPOST;       // Raw output mode
 
-    tcsetattr(uart_fd, TCSANOW, &options);
+    // 8 data bits
+    options.c_cflag &= ~CSIZE;
+    options.c_cflag |= CS8;
+
+    // No parity
+    options.c_cflag &= ~PARENB;
+
+    // 1 stop bit
+    options.c_cflag &= ~CSTOPB;
+
+    // Raw input/output
+    options.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
+    options.c_oflag &= ~OPOST;
+
+    if (tcsetattr(file, TCSANOW, &options) < 0) {
+        close(file);
+        return false;
+    }
+
     return true;
 }
 
+
 bool esp32_cam_get_frame(cam_frame_t *frame) {
-    if (uart_fd < 0 || frame == NULL) return false;
 
-    // 1. Send the API command byte to trigger the camera
-    uint8_t cmd = CMD_TRIGGER_CAPTURE;
-    if (write(uart_fd, &cmd, 1) < 0) return false;
-
-    // 2. Read the upcoming 4-byte frame length header sent by ESP32
-    uint32_t incoming_length = 0;
-    int bytes_read = 0;
-    uint8_t *len_ptr = (uint8_t *)&incoming_length;
-
-    while (bytes_read < 4) {
-        int r = read(uart_fd, len_ptr + bytes_read, 4 - bytes_read);
-        if (r > 0) bytes_read += r;
+    if (frame == NULL) {
+        return false;
     }
 
-    if (incoming_length == 0 || incoming_length > 500000) return false; // Sanity check max jpeg sizes
+    // Send capture command
+    uint8_t command = CMD_TRIGGER_CAPTURE;
 
-    // 3. Dynamic allocation based on incoming packet payload size
-    frame->length = incoming_length;
-    frame->data = (uint8_t *)malloc(incoming_length);
-    if (frame->data == NULL) return false;
+    if (write(file, &command, 1) != 1) {
+        return false;
+    }
 
-    // 4. Read the raw JPEG binary stream directly from the UART file descriptor
-    uint32_t total_payload_received = 0;
-    while (total_payload_received < frame->length) {
-        int r = read(uart_fd, frame->data + total_payload_received, frame->length - total_payload_received);
-        if (r > 0) {
-            total_payload_received += r;
+    // Receive 4-byte image length
+    uint32_t frame_length = 0;
+    uint8_t *length_bytes = (uint8_t *)&frame_length;
+
+    int bytes_received = 0;
+
+    while (bytes_received < FRAME_LENGTH_SIZE) {
+
+        int bytes_read = read(
+                file,
+                length_bytes + bytes_received,
+                FRAME_LENGTH_SIZE - bytes_received
+        );
+
+        if (bytes_read <= 0) {
+            return false;
         }
+
+        bytes_received += bytes_read;
+    }
+
+    // Check image size
+    if (frame_length == 0 || frame_length > MAX_FRAME_SIZE) {
+        return false;
+    }
+
+    // Allocate memory for JPEG
+    frame->data = malloc(frame_length);
+
+    if (frame->data == NULL) {
+        return false;
+    }
+
+    frame->length = frame_length;
+
+    // Receive JPEG data
+    uint32_t total_received = 0;
+
+    while (total_received < frame->length) {
+
+        int bytes_read = read(
+                file,
+                frame->data + total_received,
+                frame->length - total_received
+        );
+
+        if (bytes_read <= 0) {
+            free(frame->data);
+            frame->data = NULL;
+            frame->length = 0;
+
+            return false;
+        }
+
+        total_received += bytes_read;
     }
 
     return true;
 }
 
 bool esp32_cam_free_frame(cam_frame_t *frame) {
-    if (frame && frame->data) {
-        free(frame->data);
-        frame->data = NULL;
-        frame->length = 0;
-        return true;
+
+    if (frame == NULL || frame->data == NULL) {
+        return false;
     }
-    return false;
+
+    free(frame->data);
+
+    frame->data = NULL;
+    frame->length = 0;
+
+    return true;
 }
 
 bool esp32_cam_deinit(void) {
-    if (uart_fd >= 0) {
-        close(uart_fd);
-        uart_fd = -1;
+
+    if (file >= 0) {
+        close(file);
+        file = -1;
     }
+
     return true;
 }

@@ -11,7 +11,7 @@ typedef struct {
 } cam_frame_t;
 
 // API Core Lifecycle Functions
-bool esp32_cam_init(const char *serial_device);
+bool esp32_cam_init(void);
 bool esp32_cam_get_frame(cam_frame_t *frame);
 bool esp32_cam_free_frame(cam_frame_t *frame);
 bool esp32_cam_deinit(void);
