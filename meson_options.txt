@@ -1,0 +1,13 @@
+option('library',
+       type: 'feature',
+       value: 'enabled',
+       description: 'Compile as a library',
+       yield: true)
+
+option('platform',
+       type: 'combo',
+       choices : ['raspberry-pi'],
+       value : 'raspberry-pi',
+       description: 'Define compilation platform',
+       yield: true
+)
